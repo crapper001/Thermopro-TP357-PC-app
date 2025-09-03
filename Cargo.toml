@@ -1,0 +1,36 @@
+[package]
+name = "temp_monitor"
+version = "0.1.2"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# Knihovna pro multiplatformní přístup k Bluetooth LE
+btleplug = "0.11" 
+
+# Asynchronní runtime - nutný pro běh btleplug
+tokio = { version = "1", features = ["full", "rt-multi-thread"] }
+
+# Pomocné utility pro práci s asynchronními operacemi
+futures = "0.3"
+
+# NOVÉ: Knihovny pro grafické rozhraní
+egui = "0.27"
+eframe = { version = "0.27", features = ["persistence"] }
+
+# egui_plot jako NOVÁ, SAMOSTATNÁ KNIHOVNA
+egui_plot = "0.27"
+
+# NOVÉ: Knihovny pro práci s CSV a časem
+csv = "1.3"
+chrono = "0.4"
+
+# NOVÉ: Pro práci s JSON konfigurací
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Speciální sekce pro závislosti, které jsou potřeba jen během kompilace
+# (pro vložení ikony do .exe souboru na Windows)
+[build-dependencies]
+winres = "0.1"
