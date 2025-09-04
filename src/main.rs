@@ -9,16 +9,17 @@ use eframe::egui;
 use futures::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::path::Path;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // --- Konstanty a Konfigurace ---
 const MAX_HISTORY_POINTS: usize = 200;
 const CONFIG_FILE: &str = "config.json";
+const DUPLICATE_THRESHOLD_SECS: u64 = 30; // Minimální interval mezi záznamy
 
 // --- DATOVÉ STRUKTURY ---
 
@@ -29,6 +30,7 @@ struct Config {
     scan_pause_secs: u64,
     temp_warn_high: f32,
     temp_warn_low: f32,
+    continuous_mode: bool, // Nový parametr pro kontinuální režim
 }
 
 impl Default for Config {
@@ -39,6 +41,7 @@ impl Default for Config {
             scan_pause_secs: 10,
             temp_warn_high: 30.0,
             temp_warn_low: 10.0,
+            continuous_mode: false, // Výchozí je normální režim
         }
     }
 }
@@ -50,6 +53,7 @@ struct HistoryPoint {
     hum: u8,
 }
 
+#[derive(Clone)]
 struct BleDataPoint {
     timestamp: DateTime<Local>,
     temp: f32,
@@ -74,6 +78,8 @@ struct TempMonitorApp {
     #[serde(skip)]
     rx: mpsc::Receiver<ScannerMessage>,
     #[serde(skip)]
+    shared_config: Arc<Mutex<Config>>, // Sdílená konfigurace pro scanner
+    #[serde(skip)]
     history: VecDeque<HistoryPoint>,
     #[serde(skip)]
     last_data_point: Option<BleDataPoint>,
@@ -85,6 +91,8 @@ struct TempMonitorApp {
     zoom_factor: f32,
     #[serde(skip)]
     reset_plot: bool,
+    #[serde(skip)]
+    last_save_time: Option<Instant>, // Pro prevenci duplikátů
 }
 
 impl Default for TempMonitorApp {
@@ -94,12 +102,14 @@ impl Default for TempMonitorApp {
             config: load_config(),
             settings_open: false,
             rx,
+            shared_config: Arc::new(Mutex::new(Config::default())),
             history: VecDeque::new(),
             last_data_point: None,
             last_csv_write_ok: true,
             scan_status: "Inicializace...".to_string(),
             zoom_factor: 1.0,
             reset_plot: false,
+            last_save_time: None,
         }
     }
 }
@@ -115,9 +125,11 @@ impl TempMonitorApp {
         let (tx, rx) = mpsc::channel();
         app.rx = rx;
 
-        let config_clone = app.config.clone();
+        let shared_config = Arc::new(Mutex::new(app.config.clone()));
+        app.shared_config = shared_config.clone();
+
         let rt = tokio::runtime::Runtime::new().expect("Nelze vytvořit Tokio runtime");
-        rt.spawn(bluetooth_scanner(tx, config_clone));
+        rt.spawn(bluetooth_scanner(tx, shared_config));
         std::mem::forget(rt);
 
         app.history = load_history_from_csv();
@@ -125,10 +137,30 @@ impl TempMonitorApp {
     }
 
     fn add_data_point(&mut self, data: BleDataPoint) {
+        let now = Instant::now();
+        
+        // Kontrola proti duplikátním záznamům - pouze pokud není kontinuální režim
+        let should_save = if self.config.continuous_mode {
+            true // V kontinuálním režimu ukládáme vše
+        } else {
+            self.last_save_time
+                .map(|last_time| now.duration_since(last_time).as_secs() >= DUPLICATE_THRESHOLD_SECS)
+                .unwrap_or(true)
+        };
+
+        if should_save {
+            self.last_csv_write_ok = log_to_csv(data.temp, data.hum).is_ok();
+            self.last_save_time = Some(now);
+        } else {
+            // I když neukládáme do CSV, stále aktualizujeme status
+            self.last_csv_write_ok = true;
+        }
+
+        // Vždy aktualizujeme historii a UI
         if self.history.len() >= MAX_HISTORY_POINTS {
             self.history.pop_front();
         }
-        self.last_csv_write_ok = log_to_csv(data.temp, data.hum).is_ok();
+        
         let history_point = HistoryPoint {
             timestamp: data.timestamp,
             temp: data.temp,
@@ -144,9 +176,16 @@ impl eframe::App for TempMonitorApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
         save_config(&self.config);
+        // Aktualizujeme sdílenou konfiguraci
+        if let Ok(mut shared) = self.shared_config.lock() {
+            *shared = self.config.clone();
+        }
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Kontinuální překreslování pro zajištění zpracování zpráv i na pozadí
+        ctx.request_repaint();
+        
         while let Ok(message) = self.rx.try_recv() {
             match message {
                 ScannerMessage::NewData(data_point) => self.add_data_point(data_point),
@@ -170,14 +209,12 @@ impl eframe::App for TempMonitorApp {
                     }
                 });
                 ui.separator();
-                // --- ZAČÁTEK OPRAVY: Přesně podle vašeho zadání ---
                 if ui.button("➖").on_hover_text("Oddálit").clicked() {
                     self.zoom_factor = 0.7;
                 }
                 if ui.button("➕").on_hover_text("Přiblížit").clicked() {
                     self.zoom_factor = 1.25;
                 }
-                // --- KONEC OPRAVY ---
                 if ui.button("⛶").on_hover_text("Vycentrovat graf").clicked() {
                     self.reset_plot = true;
                 }
@@ -212,14 +249,33 @@ impl TempMonitorApp {
         if self.settings_open {
             let mut is_open = self.settings_open;
             egui::Window::new("Nastavení").open(&mut is_open).show(ctx, |ui| {
+                let old_continuous_mode = self.config.continuous_mode;
+                
                 ui.label("Cílová MAC adresa:");
                 ui.text_edit_singleline(&mut self.config.target_mac);
                 ui.separator();
+                
                 ui.add(egui::DragValue::new(&mut self.config.scan_timeout_secs).prefix("Timeout skenování (s): "));
                 ui.add(egui::DragValue::new(&mut self.config.scan_pause_secs).prefix("Pauza mezi skeny (s): "));
                 ui.separator();
+                
+                ui.checkbox(&mut self.config.continuous_mode, "Kontinuální režim");
+                ui.label("⚠️ Kontinuální režim zachytí všechna vysílání bez deduplikace");
+                if self.config.continuous_mode {
+                    ui.label(egui::RichText::new("POZOR: V kontinuálním režimu se mohou vytvářet velké CSV soubory!").color(egui::Color32::YELLOW));
+                    ui.label(egui::RichText::new("INFO: Kontinuální režim používá optimalizované časování").color(egui::Color32::LIGHT_BLUE));
+                }
+                ui.separator();
+                
                 ui.add(egui::DragValue::new(&mut self.config.temp_warn_high).prefix("Mez pro varování (°C): ").speed(0.1));
                 ui.add(egui::DragValue::new(&mut self.config.temp_warn_low).prefix("Spodní mez (°C): ").speed(0.1));
+                
+                // Pokud se změnil režim, aktualizujeme sdílenou konfiguraci okamžitě
+                if old_continuous_mode != self.config.continuous_mode {
+                    if let Ok(mut shared) = self.shared_config.lock() {
+                        *shared = self.config.clone();
+                    }
+                }
             });
             self.settings_open = is_open;
         }
@@ -476,37 +532,90 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native("Teploměr", options, Box::new(|cc| Box::new(TempMonitorApp::new(cc))))
 }
 
-async fn bluetooth_scanner(tx: mpsc::Sender<ScannerMessage>, config: Config) {
+async fn bluetooth_scanner(tx: mpsc::Sender<ScannerMessage>, shared_config: Arc<Mutex<Config>>) {
+    let mut processed_devices: HashMap<String, Instant> = HashMap::new();
+    
     loop {
+        // Načteme aktuální konfiguraci
+        let current_config = {
+            if let Ok(config) = shared_config.lock() {
+                config.clone()
+            } else {
+                Config::default()
+            }
+        };
+        
         let manager_result = Manager::new().await;
         let manager = match manager_result {
             Ok(m) => m,
             Err(_) => {
                 let _ = tx.send(ScannerMessage::StatusUpdate("Chyba: BT adaptér nenalezen".into()));
-                thread::sleep(Duration::from_secs(config.scan_pause_secs));
+                thread::sleep(Duration::from_secs(if current_config.continuous_mode { 1 } else { current_config.scan_pause_secs }));
                 continue;
             }
         };
 
         if let Some(central) = manager.adapters().await.unwrap_or_default().into_iter().next() {
-            let _ = tx.send(ScannerMessage::StatusUpdate("Skenuji...".into()));
+            let status_msg = if current_config.continuous_mode {
+                "Skenuji (kontinuální režim)..."
+            } else {
+                "Skenuji..."
+            };
+            let _ = tx.send(ScannerMessage::StatusUpdate(status_msg.into()));
+            
             if central.start_scan(ScanFilter::default()).await.is_ok() {
-                let _ = tokio::time::timeout(Duration::from_secs(config.scan_timeout_secs), async {
+                // V kontinuálním režimu skenujeme delší dobu
+                let scan_duration = if current_config.continuous_mode {
+                    60 // 60 sekund v kontinuálním režimu
+                } else {
+                    current_config.scan_timeout_secs
+                };
+                
+                let _ = tokio::time::timeout(Duration::from_secs(scan_duration), async {
                     let mut events = central.events().await.unwrap();
                     while let Some(event) = events.next().await {
                         if let CentralEvent::DeviceDiscovered(id) | CentralEvent::DeviceUpdated(id) = event {
                             if let Ok(p) = central.peripheral(&id).await {
                                 if let Ok(Some(props)) = p.properties().await {
-                                    if props.address.to_string().eq_ignore_ascii_case(&config.target_mac) {
-                                        if let Some((company_id, data)) = props.manufacturer_data.iter().next() {
-                                            if data.len() >= 2 {
-                                                let temp = i16::from_le_bytes([(*company_id >> 8) as u8, data[0]]) as f32 / 10.0;
-                                                let hum = data[1];
-                                                let data_point = BleDataPoint {
-                                                    timestamp: Local::now(), temp, hum,
-                                                    device_id: id.to_string(), rssi: props.rssi, raw_data: data.clone(),
-                                                };
-                                                if tx.send(ScannerMessage::NewData(data_point)).is_ok() { return; }
+                                    if props.address.to_string().eq_ignore_ascii_case(&current_config.target_mac) {
+                                        let device_key = format!("{}_{}", props.address, props.rssi.unwrap_or(0));
+                                        let now = Instant::now();
+                                        
+                                        // V kontinuálním režimu přeskakujeme deduplikaci na úrovni scanneru
+                                        let should_process = if current_config.continuous_mode {
+                                            true
+                                        } else {
+                                            processed_devices
+                                                .get(&device_key)
+                                                .map(|last_time| now.duration_since(*last_time).as_secs() >= DUPLICATE_THRESHOLD_SECS)
+                                                .unwrap_or(true)
+                                        };
+
+                                        if should_process {
+                                            if let Some((company_id, data)) = props.manufacturer_data.iter().next() {
+                                                if data.len() >= 2 {
+                                                    let temp = i16::from_le_bytes([(*company_id >> 8) as u8, data[0]]) as f32 / 10.0;
+                                                    let hum = data[1];
+                                                    let data_point = BleDataPoint {
+                                                        timestamp: Local::now(), 
+                                                        temp, 
+                                                        hum,
+                                                        device_id: id.to_string(), 
+                                                        rssi: props.rssi, 
+                                                        raw_data: data.clone(),
+                                                    };
+                                                    
+                                                    if !current_config.continuous_mode {
+                                                        processed_devices.insert(device_key, now);
+                                                    }
+                                                    
+                                                    if tx.send(ScannerMessage::NewData(data_point)).is_ok() { 
+                                                        if !current_config.continuous_mode {
+                                                            return; // V normálním režimu ukončíme po prvním úspěšném nálezu
+                                                        }
+                                                        // V kontinuálním režimu pokračujeme ve skenování
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -518,7 +627,21 @@ async fn bluetooth_scanner(tx: mpsc::Sender<ScannerMessage>, config: Config) {
                 let _ = central.stop_scan().await;
             }
         }
+        
+        // Vyčištění starých záznamů - pouze v normálním režimu
+        if !current_config.continuous_mode {
+            let now = Instant::now();
+            processed_devices.retain(|_, last_time| now.duration_since(*last_time).as_secs() < DUPLICATE_THRESHOLD_SECS * 2);
+        }
+        
         let _ = tx.send(ScannerMessage::StatusUpdate("Čekám...".into()));
-        thread::sleep(Duration::from_secs(config.scan_pause_secs));
+        
+        // V kontinuálním režimu kratší pauza
+        let pause_duration = if current_config.continuous_mode {
+            1 // Jen 1 sekunda pauzy v kontinuálním režimu
+        } else {
+            current_config.scan_pause_secs
+        };
+        thread::sleep(Duration::from_secs(pause_duration));
     }
 }
