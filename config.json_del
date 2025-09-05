@@ -1,8 +1,0 @@
-{
-  "target_mac": "B8:59:CE:33:0F:93",
-  "scan_timeout_secs": 15,
-  "scan_pause_secs": 10,
-  "temp_warn_high": 30.0,
-  "temp_warn_low": 10.0,
-  "continuous_mode": true
-}
