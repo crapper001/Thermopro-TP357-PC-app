@@ -167,9 +167,9 @@ impl eframe::App for TempMonitorApp {
                         columns[2].vertical(|ui| draw_scan_metadata(ui, &self.last_data_point, &self.scan_status));
                         columns[3].vertical(|ui| draw_data_details(ui, &self.last_data_point, self.last_csv_write_ok));
                     });});
-                    strip.cell(|ui| { ui.label(egui::RichText::new("Teplota").strong()); draw_temperature_graph(self, ui, ctx); });
-                    strip.cell(|ui| { ui.label(egui::RichText::new("Vlhkost").strong()); draw_humidity_graph(self, ui, ctx); });
-                    strip.cell(|ui| { ui.separator(); ui.vertical_centered(|ui| { ui.horizontal_centered(|ui| { ui.label("Autorem aplikace je Soběslav Holec"); });});});
+                    strip.cell(|ui| { ui.label(egui::RichText::new("Teplota").size(14.0).strong()); draw_temperature_graph(self, ui, ctx); });
+                    strip.cell(|ui| { ui.label(egui::RichText::new("Vlhkost").size(14.0).strong()); draw_humidity_graph(self, ui, ctx); });
+                    strip.cell(|ui| { ui.separator(); ui.vertical_centered(|ui| { ui.horizontal_centered(|ui| { ui.label(egui::RichText::new(format!("Autorem aplikace je Soběslav Holec")).size(20.0).color(egui::Color32::WHITE)); });});});
                 });
         });
 
@@ -224,13 +224,44 @@ impl TempMonitorApp {
     }
 }
 
+// --- Pomocná funkce: mapování hodnot na barvu ---
+// 0.0 → modrá, ~0.33 → zelená, ~0.66 → oranžová, 1.0 → červená
+fn value_to_color(value: f64, min: f64, max: f64) -> egui::Color32 {
+    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+
+    if t < 0.33 {
+        // modrá → zelená
+        egui::Color32::from_rgb(0, (t * 3.0 * 255.0) as u8, 255)
+    } else if t < 0.66 {
+        // zelená → oranžová
+        egui::Color32::from_rgb(0, 255, 255 - ((t - 0.33) * 3.0 * 255.0) as u8)
+    } else {
+        // oranžová → červená
+        egui::Color32::from_rgb(255, 255 - ((t - 0.66) * 3.0 * 255.0) as u8, 0)
+    }
+}
+
+fn humidity_to_color(value: f64, min: f64, max: f64) -> egui::Color32 {
+    let t = ((value - min) / (max - min)).clamp(0.0, 1.0);
+
+    if t < 0.33 {
+        // červená → oranžová
+        egui::Color32::from_rgb(255, (t * 3.0 * 255.0) as u8, 0)
+    } else if t < 0.66 {
+        // oranžová → zelená
+        egui::Color32::from_rgb(255 - ((t - 0.33) * 3.0 * 255.0) as u8, 255, 0)
+    } else {
+        // zelená → modrá
+        egui::Color32::from_rgb(0, 255 - ((t - 0.66) * 3.0 * 255.0) as u8, 255)
+    }
+}
+
 // --- Vykreslovací funkce ---
 
 fn draw_temperature_graph(app: &mut TempMonitorApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    use egui_plot::{GridMark, Line, Plot, Points, MarkerShape, PlotPoints};
+    use egui_plot::{GridMark, Line, Plot, Points, PlotPoints};
     let temp_data_points: Vec<[f64; 2]> = app.history.iter().map(|p| [p.timestamp.timestamp() as f64, p.temp as f64]).collect();
     let temp_line = Line::new(PlotPoints::new(temp_data_points.clone())).color(egui::Color32::from_rgb(255, 100, 100)).width(2.0);
-    let temp_points = Points::new(PlotPoints::new(temp_data_points)).shape(MarkerShape::Circle).radius(3.0).color(egui::Color32::from_rgb(0, 255, 0)).highlight(true);
 
     let mut plot = Plot::new("temperature_plot").height(ui.available_height()).width(ui.available_width())
         .link_axis(egui::Id::new("linked_plots"), true, false).show_background(false).allow_drag(true).allow_zoom(true)
@@ -245,8 +276,23 @@ fn draw_temperature_graph(app: &mut TempMonitorApp, ui: &mut egui::Ui, ctx: &egu
 
     // OPRAVA: Výsledek se už neukládá do proměnné
     plot.show(ui, |plot_ui| {
+        // křivka
         plot_ui.line(temp_line);
-        plot_ui.points(temp_points);
+
+        // barevné body podle hodnoty (-10 až 50 °C)
+        for p in app.history.iter() {
+            let x = p.timestamp.timestamp() as f64;
+            let y = p.temp as f64;
+            let color = value_to_color(y, 0.0, 40.0);
+            let pp = PlotPoints::new(vec![[x, y]]);
+            plot_ui.points(
+                Points::new(pp)
+                    .radius(3.0)
+                    .color(color)
+                    .highlight(true)
+            );
+        }
+
         if app.zoom_factor != 1.0 { plot_ui.zoom_bounds(egui::vec2(app.zoom_factor, app.zoom_factor), plot_ui.plot_bounds().center()); }
         
         if plot_ui.response().clicked() {
@@ -266,10 +312,9 @@ fn draw_temperature_graph(app: &mut TempMonitorApp, ui: &mut egui::Ui, ctx: &egu
 }
 
 fn draw_humidity_graph(app: &mut TempMonitorApp, ui: &mut egui::Ui, ctx: &egui::Context) {
-    use egui_plot::{GridMark, Line, Plot, Points, MarkerShape, PlotPoints};
+    use egui_plot::{GridMark, Line, Plot, Points, PlotPoints};
     let hum_data_points: Vec<_> = app.history.iter().map(|p| [p.timestamp.timestamp() as f64, p.hum as f64]).collect();
     let hum_line = Line::new(PlotPoints::new(hum_data_points.clone())).color(egui::Color32::from_rgb(100, 100, 255)).width(2.0);
-    let hum_points = Points::new(PlotPoints::new(hum_data_points)).shape(MarkerShape::Circle).radius(3.0).color(egui::Color32::from_rgb(0, 255, 0)).highlight(true);
 
     let mut plot = Plot::new("humidity_plot").height(ui.available_height()).width(ui.available_width())
         .link_axis(egui::Id::new("linked_plots"), true, false).show_background(false).allow_drag(true).allow_zoom(true)
@@ -283,8 +328,23 @@ fn draw_humidity_graph(app: &mut TempMonitorApp, ui: &mut egui::Ui, ctx: &egui::
     }
     
     plot.show(ui, |plot_ui| {
+        // křivka
         plot_ui.line(hum_line);
-        plot_ui.points(hum_points);
+
+        // barevné body podle hodnoty (0 až 100 %)
+        for p in app.history.iter() {
+            let x = p.timestamp.timestamp() as f64;
+            let y = p.hum as f64;
+            let color = humidity_to_color(y, 0.0, 100.0);
+            let pp = PlotPoints::new(vec![[x, y]]);
+            plot_ui.points(
+                Points::new(pp)
+                    .radius(3.0)
+                    .color(color)
+                    .highlight(true)
+            );
+        }
+
         if app.zoom_factor != 1.0 { plot_ui.zoom_bounds(egui::vec2(app.zoom_factor, app.zoom_factor), plot_ui.plot_bounds().center()); }
         
         if plot_ui.response().clicked() {
@@ -311,39 +371,39 @@ fn get_daily_log_filename() -> String { Local::now().format("log_%Y-%m-%d.csv").
 fn draw_temperature_info(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>, config: &Config) {
     let temp_min = history.iter().map(|p| p.temp).min_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal)).unwrap_or(0.0);
     let temp_max = history.iter().map(|p| p.temp).max_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal)).unwrap_or(0.0);
-    ui.label(egui::RichText::new("Teplota").color(egui::Color32::GRAY));
+    ui.label(egui::RichText::new("Teplota").size(22.0).color(egui::Color32::GRAY));
     if let Some(point) = history.back() {
         let current_temp = point.temp;
         let mut color = egui::Color32::from_rgb(255, 100, 100);
         if current_temp > config.temp_warn_high { color = egui::Color32::GOLD; } else if current_temp < config.temp_warn_low { color = egui::Color32::from_rgb(120, 180, 255); }
-        ui.label(egui::RichText::new(format!("{:.1}°C", current_temp)).size(32.0).color(color));
+        ui.label(egui::RichText::new(format!("{:.1}°C", current_temp)).size(42.0).color(color));
     } else { ui.label(egui::RichText::new("N/A").size(32.0)); }
-    ui.label(format!("Min: {:.1}° / Max: {:.1}°", temp_min, temp_max));
+    ui.label(egui::RichText::new(format!("Min: {:.1}° / Max: {:.1}°", temp_min, temp_max)).size(20.0).color(egui::Color32::WHITE));
 }
 
 fn draw_humidity_info(ui: &mut egui::Ui, history: &VecDeque<HistoryPoint>) {
     let hum_min = history.iter().map(|p| p.hum).min().unwrap_or(0);
     let hum_max = history.iter().map(|p| p.hum).max().unwrap_or(0);
-    ui.label(egui::RichText::new("Vlhkost").color(egui::Color32::GRAY));
+    ui.label(egui::RichText::new("Vlhkost").size(22.0).color(egui::Color32::GRAY));
     if let Some(point) = history.back() {
-        ui.label(egui::RichText::new(format!("{}%", point.hum)).size(32.0).color(egui::Color32::from_rgb(100, 100, 255)));
+        ui.label(egui::RichText::new(format!("{}%", point.hum)).size(42.0).color(egui::Color32::from_rgb(100, 100, 255)));
     } else { ui.label(egui::RichText::new("N/A").size(32.0)); }
-    ui.label(format!("Min: {}% / Max: {}%", hum_min, hum_max));
+    ui.label(egui::RichText::new(format!("Min: {}% / Max: {}%", hum_min, hum_max)).size(20.0).color(egui::Color32::WHITE));
 }
 
 fn draw_scan_metadata(ui: &mut egui::Ui, last_data: &Option<BleDataPoint>, status: &str) {
     ui.horizontal(|ui| { ui.label(egui::RichText::new("Stav:").color(egui::Color32::GRAY)); ui.label(status); });
     if let Some(data) = last_data {
-        ui.horizontal(|ui| { ui.label(egui::RichText::new("Aktualizace:").color(egui::Color32::GRAY)); ui.label(data.timestamp.format("%H:%M:%S").to_string()); });
-        ui.horizontal(|ui| { ui.label(egui::RichText::new("RSSI:").color(egui::Color32::GRAY)); if let Some(rssi) = data.rssi { ui.label(format!("{} dBm", rssi)); } else { ui.label("N/A"); }});
+        ui.horizontal(|ui| { ui.label(egui::RichText::new("Aktualizace:").size(17.0).color(egui::Color32::GRAY)); ui.label(data.timestamp.format("%H:%M:%S").to_string()); });
+        ui.horizontal(|ui| { ui.label(egui::RichText::new("RSSI:").size(17.0).color(egui::Color32::GRAY)); if let Some(rssi) = data.rssi { ui.label(format!("{} dBm", rssi)); } else { ui.label("N/A"); }});
     }
 }
 
 fn draw_data_details(ui: &mut egui::Ui, last_data: &Option<BleDataPoint>, csv_ok: bool) {
     if let Some(data) = last_data {
-        ui.horizontal(|ui| { ui.label(egui::RichText::new("ID Zařízení:").color(egui::Color32::GRAY)); ui.label(data.device_id.to_string()); });
-        ui.horizontal(|ui| { ui.label(egui::RichText::new("Raw data:").color(egui::Color32::GRAY)); ui.label(data.raw_data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")); });
-        ui.horizontal(|ui| { ui.label(egui::RichText::new("Zápis CSV:").color(egui::Color32::GRAY)); if csv_ok { ui.label(egui::RichText::new("OK").color(egui::Color32::GREEN)); } else { ui.label(egui::RichText::new("Chyba").color(egui::Color32::RED)); } });
+        ui.horizontal(|ui| { ui.label(egui::RichText::new("ID Zařízení:").size(17.0).color(egui::Color32::GRAY)); ui.label(data.device_id.to_string()); });
+        ui.horizontal(|ui| { ui.label(egui::RichText::new("Raw data:").size(17.0).color(egui::Color32::GRAY)); ui.label(data.raw_data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ")); });
+        ui.horizontal(|ui| { ui.label(egui::RichText::new("Zápis CSV:").size(17.0).color(egui::Color32::GRAY)); if csv_ok { ui.label(egui::RichText::new("OK").color(egui::Color32::GREEN)); } else { ui.label(egui::RichText::new("Chyba").color(egui::Color32::RED)); } });
     }
 }
 
